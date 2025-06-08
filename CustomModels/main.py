@@ -1,0 +1,700 @@
+import torch
+import torch.nn.functional as F
+import torch_geometric as tg
+from torch_geometric import nn
+from torch_geometric.data import Data
+import pytorch_lightning as L
+import numpy as np
+import torch
+import random
+
+def compute_metrics(y_true: torch.Tensor, y_pred: torch.Tensor):
+    # convert to numpy for metric calculations
+    y_true_np = y_true.detach().cpu().numpy()
+    y_pred_np = y_pred.detach().cpu().numpy()
+    mae = np.mean(np.abs(y_true_np - y_pred_np))
+    mse = np.mean((y_true_np - y_pred_np) ** 2)
+    rmse = np.sqrt(mse)
+    mape = np.mean(np.abs((y_true_np - y_pred_np) / (y_true_np + 1e-8))) * 100  # Avoid division by zero
+    return mae, mse, rmse, mape
+
+class STGAT(torch.nn.Module):
+    def __init__(
+        self,
+        in_channel: int,
+        out_channel: int,
+        n_nodes: int,
+        att_head_nodes: int,
+        drop_out: float,
+        lstm_dim: list[int],
+        prediction_time_step: int,
+    ) -> None:
+        super(STGAT, self).__init__()
+        self.num_nodes = n_nodes
+        self.drop_out = drop_out
+        self.att_head_nodes = att_head_nodes
+        self.prediction_t_step = prediction_time_step
+        # init GAT layer for phase 1
+        self.gat = nn.GATConv(
+            in_channels=in_channel,
+            out_channels=in_channel,
+            heads=att_head_nodes,
+            dropout=drop_out,
+            concat=False,
+        )
+
+        # phase 2: pass embedding layer from GAT block to LSTM block with n LSTM layer
+        self.lstms = torch.nn.ModuleList()
+        lstm_dim.insert(0, self.num_nodes)
+        for i in range(1, len(lstm_dim)):
+            lstm_layer = torch.nn.LSTM(
+                input_size=lstm_dim[i - 1],
+                hidden_size=lstm_dim[i],
+                num_layers=1,
+            )
+
+            for name, param in lstm_layer.named_parameters():
+                if "weight" in name:
+                    torch.nn.init.xavier_normal_(param)
+                elif "bias" in name:
+                    torch.nn.init.constant_(param, 0)
+            self.lstms.append(lstm_layer)
+
+        self.linear = torch.nn.Linear(
+            lstm_dim[-1],
+            self.num_nodes * prediction_time_step,
+        )
+
+        torch.nn.init.xavier_normal_(self.linear.weight)
+
+    def forward(self, data: tg.data.Data):
+        X, edge_index = data.x, data.edge_index
+
+        # phase 1: Passing data into GAT block for extracting spatial features
+        # The shape of vector embedding is [n, H]
+        h = X.float()
+        h = self.gat(h, edge_index)
+        h = F.dropout(h, self.drop_out, self.training)
+        # phase 2: Passing data into LSTM block
+        batch_size = data.num_graphs
+        n_nodes = int(data.num_nodes / batch_size)
+
+        h = h.view((batch_size, n_nodes, data.num_features))
+        # swap value at dimension 2 to dimension 0
+        h = torch.movedim(h, 2, 0)
+        for lstm_layer in self.lstms:
+            h, _ = lstm_layer(h)
+
+        # flatten embedding vector to 1 dim vector
+        h = torch.squeeze(h[-1, :, :])
+        h = self.linear(h)
+        # the final output of fc layer will be convert into [batch_size, num_node, prediction_time_step]
+        shape = h.shape
+        h = h.view((shape[0], self.num_nodes, self.prediction_t_step))
+        # After that, we will convert 3d vector to 2d vector which has a shape like label [n, H]
+        h = h.view(shape[0] * self.num_nodes, self.prediction_t_step)
+        return h
+    
+class STGATModel(L.LightningModule):
+    def __init__(self,
+                 in_channel: int,
+                 out_channel: int,
+                 n_nodes: int,
+                 att_head_nodes: int,
+                 drop_out: float,
+                 lstm_dim: list[int],
+                 prediction_time_step: int,
+                 lr: float,
+                 weight_decay: float,
+                 batch_size: int
+                 ):
+        super().__init__()
+        self.model = STGAT(in_channel,
+                            out_channel,
+                            n_nodes,
+                            att_head_nodes,
+                            drop_out,
+                            lstm_dim,
+                            prediction_time_step)
+        
+        self.loss = torch.nn.MSELoss()
+        self.weight_decay = weight_decay
+        self.lr = lr 
+        self.batch_size = batch_size
+        self.history = {
+            "epochs" : [],
+            "loss" : [],
+            "val_loss" : [],
+            "train_MSE" : [],
+            "train_MAE" : [],
+            "train_RMSE" : [],
+            "train_MAPE" : [],
+            "val_MSE" : [],
+            "val_MAE" : [],
+            "val_RMSE" : [],
+            "val_MAPE" : []
+        }
+        
+        self.training_step_outputs = {
+            "loss" : [],
+            "val_loss" : [],
+            "train_MSE" : [],
+            "train_MAE" : [],
+            "train_RMSE" : [],
+            "train_MAPE" : [],
+            "val_MSE" : [],
+            "val_MAE" : [],
+            "val_RMSE" : [],
+            "val_MAPE" : []
+        }
+        
+        self.save_hyperparameters()
+        
+    def forward(self, data: tg.data.Data):
+        return self.model(data)
+    
+    def _shared_eval_step(self, data: tg.data.Data):
+        pred = self.model(data)
+        loss = self.loss(data.y.float(), pred)
+        # Optionally log additional metrics using compute_metrics
+        mae, mse, rmse, mape = compute_metrics(data.y.float(), pred)
+        return loss, pred, mae, mse, rmse, mape
+    
+    def training_step(self, data: tg.data.Data):
+        loss, _, mae, mse, rmse, mape = self._shared_eval_step(data)
+        self.log("loss", loss, prog_bar=True, on_step=False, on_epoch=True, batch_size=self.batch_size)
+        self.log("MSE", mse, prog_bar=True, on_step=False, on_epoch=True, batch_size=self.batch_size)
+        self.log("MAE", mae, prog_bar=True, on_step=False, on_epoch=True, batch_size=self.batch_size)
+        self.log("RMSE", rmse, prog_bar=True, on_step=False, on_epoch=True, batch_size=self.batch_size)
+        self.log("MAPE", mape, prog_bar=True, on_step=False, on_epoch=True, batch_size=self.batch_size)
+
+        self.training_step_outputs["loss"].append(loss.item())
+        self.training_step_outputs["train_MSE"].append(mse)
+        self.training_step_outputs["train_MAE"].append(mae)
+        self.training_step_outputs["train_RMSE"].append(rmse)
+        self.training_step_outputs["train_MAPE"].append(mape)
+        return loss
+    
+    def validation_step(self, data: tg.data.Data):
+        loss, _, mae, mse, rmse, mape = self._shared_eval_step(data)
+        self.log("val_loss", loss, prog_bar=True, on_step=False, on_epoch=True, batch_size=self.batch_size)
+        self.log("val_MSE", mse, prog_bar=True, on_step=False, on_epoch=True, batch_size=self.batch_size)
+        self.log("val_MAE", mae, prog_bar=True, on_step=False, on_epoch=True, batch_size=self.batch_size)
+        self.log("val_RMSE", rmse, prog_bar=True, on_step=False, on_epoch=True, batch_size=self.batch_size)
+        self.log("val_MAPE", mape, prog_bar=True, on_step=False, on_epoch=True, batch_size=self.batch_size)
+
+        self.training_step_outputs["val_loss"].append(loss.item())
+        self.training_step_outputs["val_MSE"].append(mse)
+        self.training_step_outputs["val_MAE"].append(mae)
+        self.training_step_outputs["val_RMSE"].append(rmse)
+        self.training_step_outputs["val_MAPE"].append(mape)
+        return loss
+    
+    def test_step(self, data: tg.data.Data):
+        _, pred, _, _, _, _ = self._shared_eval_step(data)
+        y_true = data.y.float()
+        _, horizon = pred.shape
+        
+        for i in range(horizon):
+            mse_horizon = self.loss(pred[:, i], y_true[:, i])
+            self.log(f"test_mse_horizon_{i+1}", mse_horizon, on_step=False, on_epoch=True, batch_size=self.batch_size)
+            mae, mse, rmse, mape = compute_metrics(y_true[:, i], pred[:, i])
+            self.log(f"test_mae_horizon_{i+1}", mae, on_step=False, on_epoch=True, batch_size=self.batch_size)
+            self.log(f"test_rmse_horizon_{i+1}", rmse, on_step=False, on_epoch=True, batch_size=self.batch_size)
+            self.log(f"test_mape_horizon_{i+1}", mape, on_step=False, on_epoch=True, batch_size=self.batch_size)
+    
+    def on_train_epoch_end(self) -> None:
+        self.history["epochs"].append(self.current_epoch)
+        if self.training_step_outputs["loss"]:
+            avg_train_loss = sum(self.training_step_outputs["loss"]) / len(self.training_step_outputs["loss"])
+            self.history["loss"].append(avg_train_loss)
+        if self.training_step_outputs["val_loss"]:
+            avg_val_loss = sum(self.training_step_outputs["val_loss"]) / len(self.training_step_outputs["val_loss"])
+            self.history["val_loss"].append(avg_val_loss)
+        if self.training_step_outputs["train_MSE"]:
+            avg_train_mse = sum(self.training_step_outputs["train_MSE"]) / len(self.training_step_outputs["train_MSE"])
+            self.history["train_MSE"].append(avg_train_mse)
+        if self.training_step_outputs["train_MAE"]:
+            avg_train_mae = sum(self.training_step_outputs["train_MAE"]) / len(self.training_step_outputs["train_MAE"])
+            self.history["train_MAE"].append(avg_train_mae)
+        if self.training_step_outputs["train_RMSE"]:
+            avg_train_rmse = sum(self.training_step_outputs["train_RMSE"]) / len(self.training_step_outputs["train_RMSE"])
+            self.history["train_RMSE"].append(avg_train_rmse)
+        if self.training_step_outputs["train_MAPE"]:
+            avg_train_mape = sum(self.training_step_outputs["train_MAPE"]) / len(self.training_step_outputs["train_MAPE"])
+            self.history["train_MAPE"].append(avg_train_mape)
+        if self.training_step_outputs["val_MSE"]:
+            avg_val_mse = sum(self.training_step_outputs["val_MSE"]) / len(self.training_step_outputs["val_MSE"])
+            self.history["val_MSE"].append(avg_val_mse)
+        if self.training_step_outputs["val_MAE"]:
+            avg_val_mae = sum(self.training_step_outputs["val_MAE"]) / len(self.training_step_outputs["val_MAE"])
+            self.history["val_MAE"].append(avg_val_mae)
+        if self.training_step_outputs["val_RMSE"]:
+            avg_val_rmse = sum(self.training_step_outputs["val_RMSE"]) / len(self.training_step_outputs["val_RMSE"])
+            self.history["val_RMSE"].append(avg_val_rmse)
+        if self.training_step_outputs["val_MAPE"]:
+            avg_val_mape = sum(self.training_step_outputs["val_MAPE"]) / len(self.training_step_outputs["val_MAPE"])
+            self.history["val_MAPE"].append(avg_val_mape)
+
+        self.training_step_outputs = {"loss": [], "val_loss" : [], 
+                                      "train_MSE": [], "train_MAE": [], 
+                                      "train_RMSE": [], "train_MAPE": [],
+                                      "val_MSE": [], "val_MAE": [],
+                                      "val_RMSE": [], "val_MAPE": []}
+        
+    def configure_optimizers(self):
+        return torch.optim.Adam(self.model.parameters(), lr=self.lr, weight_decay=self.weight_decay)
+    
+
+class GCNLSTM(torch.nn.Module):
+    def __init__(
+        self,
+        in_channel: int,
+        gcn_hidden_channel: int,
+        n_nodes: int,
+        drop_out: float,
+        lstm_dim: list[int],
+        prediction_time_step: int,
+    ) -> None:
+        super(GCNLSTM, self).__init__()
+        self.num_nodes = n_nodes
+        self.drop_out = drop_out
+        self.prediction_t_step = prediction_time_step
+
+        self.gcn = nn.GCNConv(
+            in_channels=in_channel,
+            out_channels=gcn_hidden_channel,
+        )
+
+        self.lstms = torch.nn.ModuleList()
+        _lstm_dim_internal = lstm_dim.copy()
+        # Input to LSTM: (seq_len=gcn_hidden_channel, batch_size, features_per_step=n_nodes)
+        _lstm_dim_internal.insert(0, self.num_nodes)
+        for i in range(1, len(_lstm_dim_internal)):
+            lstm_layer = torch.nn.LSTM(
+                input_size=_lstm_dim_internal[i - 1],
+                hidden_size=_lstm_dim_internal[i],
+                num_layers=1,
+                batch_first=False 
+            )
+            for name, param in lstm_layer.named_parameters():
+                if "weight" in name:
+                    torch.nn.init.xavier_normal_(param)
+                elif "bias" in name:
+                    torch.nn.init.constant_(param, 0)
+            self.lstms.append(lstm_layer)
+
+        self.linear = torch.nn.Linear(
+            _lstm_dim_internal[-1],
+            self.num_nodes * prediction_time_step,
+        )
+        torch.nn.init.xavier_normal_(self.linear.weight)
+
+    def forward(self, data: tg.data.Data):
+        X, edge_index = data.x, data.edge_index
+        batch_size = data.num_graphs
+        
+        h = X.float()
+        h = self.gcn(h, edge_index, edge_weight=data.edge_label if hasattr(data, 'edge_label') else None) # (total_nodes, gcn_hidden_channel)
+        h = F.relu(h)
+        h = F.dropout(h, self.drop_out, self.training)
+
+        # Reshape for LSTM
+        # Current h: (batch_size * self.num_nodes, gcn_hidden_channel)
+        # Target LSTM input: (gcn_hidden_channel, batch_size, self.num_nodes)
+        h = h.view((batch_size, self.num_nodes, -1)) # (batch_size, self.num_nodes, gcn_hidden_channel)
+        h = h.permute(2, 0, 1) # (gcn_hidden_channel, batch_size, self.num_nodes)
+
+        for lstm_layer in self.lstms:
+            h, _ = lstm_layer(h) # (gcn_hidden_channel, batch_size, lstm_hidden_size)
+
+        h = h[-1, :, :] # (batch_size, lstm_hidden_size_last_layer)
+        h = self.linear(h) # (batch_size, self.num_nodes * prediction_time_step)
+
+        h = h.view((batch_size, self.num_nodes, self.prediction_t_step))
+        h = h.reshape(-1, self.prediction_t_step) # (total_nodes_in_batch, prediction_time_step)
+        return h
+
+class GATLSTM(torch.nn.Module):
+    def __init__(
+        self,
+        in_channel: int,
+        gat_out_channel: int, # Feature dimension per head
+        n_nodes: int,
+        att_heads: int,
+        concat_gat: bool,
+        drop_out: float,
+        lstm_dim: list[int],
+        prediction_time_step: int,
+    ) -> None:
+        super(GATLSTM, self).__init__()
+        self.num_nodes = n_nodes
+        self.drop_out = drop_out
+        self.prediction_t_step = prediction_time_step
+
+        self.gat = nn.GATConv(
+            in_channels=in_channel,
+            out_channels=gat_out_channel,
+            heads=att_heads,
+            dropout=drop_out, # Dropout within GAT attention mechanism
+            concat=concat_gat,
+        )
+
+        if concat_gat:
+            gat_effective_out_channels = gat_out_channel * att_heads
+        else:
+            gat_effective_out_channels = gat_out_channel
+            
+        self.lstms = torch.nn.ModuleList()
+        _lstm_dim_internal = lstm_dim.copy()
+        # Input to LSTM: (seq_len=gat_effective_out_channels, batch_size, features_per_step=n_nodes)
+        _lstm_dim_internal.insert(0, self.num_nodes) 
+        for i in range(1, len(_lstm_dim_internal)):
+            lstm_layer = torch.nn.LSTM(
+                input_size=_lstm_dim_internal[i - 1],
+                hidden_size=_lstm_dim_internal[i],
+                num_layers=1,
+                batch_first=False
+            )
+            for name, param in lstm_layer.named_parameters():
+                if "weight" in name:
+                    torch.nn.init.xavier_normal_(param)
+                elif "bias" in name:
+                    torch.nn.init.constant_(param, 0)
+            self.lstms.append(lstm_layer)
+
+        self.linear = torch.nn.Linear(
+            _lstm_dim_internal[-1],
+            self.num_nodes * prediction_time_step,
+        )
+        torch.nn.init.xavier_normal_(self.linear.weight)
+
+    def forward(self, data: tg.data.Data):
+        X, edge_index = data.x, data.edge_index
+        batch_size = data.num_graphs
+
+        h = X.float()
+        h = self.gat(h, edge_index) # (total_nodes, gat_effective_out_channels)
+        h = F.dropout(h, self.drop_out, self.training) # Additional dropout on GAT output features
+
+        # Reshape for LSTM
+        # Current h: (batch_size * self.num_nodes, gat_effective_out_channels)
+        # Target LSTM input: (gat_effective_out_channels, batch_size, self.num_nodes)
+        h = h.view((batch_size, self.num_nodes, -1)) # (batch_size, self.num_nodes, gat_effective_out_channels)
+        h = h.permute(2, 0, 1) # (gat_effective_out_channels, batch_size, self.num_nodes)
+
+        for lstm_layer in self.lstms:
+            h, _ = lstm_layer(h) # (gat_effective_out_channels, batch_size, lstm_hidden_size)
+
+        h = h[-1, :, :] # (batch_size, lstm_hidden_size_last_layer)
+        h = self.linear(h) # (batch_size, self.num_nodes * prediction_time_step)
+
+        h = h.view((batch_size, self.num_nodes, self.prediction_t_step))
+        h = h.reshape(-1, self.prediction_t_step) # (total_nodes_in_batch, prediction_time_step)
+        return h
+
+class GCNLSTMModel(L.LightningModule):
+    def __init__(self,
+                    in_channel: int,
+                    gcn_hidden_channel: int,
+                    n_nodes: int,
+                    drop_out: float,
+                    lstm_dim: list[int],
+                    prediction_time_step: int,
+                    lr: float,
+                    weight_decay: float,
+                    batch_size: int
+                    ):
+        super().__init__()
+        self.model = GCNLSTM(in_channel=in_channel,
+                                gcn_hidden_channel=gcn_hidden_channel,
+                                n_nodes=n_nodes,
+                                drop_out=drop_out,
+                                lstm_dim=lstm_dim,
+                                prediction_time_step=prediction_time_step)
+        
+        self.loss_fn = torch.nn.MSELoss() # Renamed from self.loss to avoid conflict with PL attributes
+        self.batch_size = batch_size
+        self.lr = lr 
+        self.weight_decay = weight_decay
+        self.history = {
+            "epochs" : [],
+            "loss" : [],
+            "val_loss" : [],
+            "train_MSE" : [],
+            "train_MAE" : [],
+            "train_RMSE" : [],
+            "train_MAPE" : [],
+            "val_MSE" : [],
+            "val_MAE" : [],
+            "val_RMSE" : [],
+            "val_MAPE" : []
+        }
+        self.step_outputs_agg = {"loss": [], 
+                                 "val_loss": [],
+                                    "train_MSE": [],
+                                    "train_MAE": [],
+                                    "train_RMSE": [],
+                                    "train_MAPE": [],
+                                    "val_MSE": [],
+                                    "val_MAE": [],
+                                    "val_RMSE": [],
+                                    "val_MAPE": []
+                                 }
+        
+        self.save_hyperparameters()
+        
+    def forward(self, data: tg.data.Data):
+        return self.model(data)
+    
+    def _shared_eval_step(self, batch: tg.data.Data):
+        pred = self.model(batch)
+        loss = self.loss_fn(pred, batch.y.float())
+        # Optionally log additional metrics using compute_metrics
+        mae, mse, rmse, mape = compute_metrics(batch.y.float(), pred)
+        return loss, pred, mae, mse, rmse, mape
+    
+    def training_step(self, batch: tg.data.Data, batch_idx: int):
+        loss, _, mae, mse, rmse, mape = self._shared_eval_step(batch)
+        self.log("loss", loss, prog_bar=True, on_step=True, on_epoch=True, batch_size=self.batch_size)
+        self.log("MSE", mse, prog_bar=True, on_step=True, on_epoch=True, batch_size=self.batch_size)
+        self.log("MAE", mae, prog_bar=True, on_step=True, on_epoch=True, batch_size=self.batch_size)
+        self.log("RMSE", rmse, prog_bar=True, on_step=True, on_epoch=True, batch_size=self.batch_size)
+        # self.log("MAPE", mape, prog_bar=True, on_step=True, on_epoch=True, batch_size=batch.num_graphs)
+        self.step_outputs_agg["loss"].append(loss.item())
+        self.step_outputs_agg["train_MSE"].append(mse)
+        self.step_outputs_agg["train_MAE"].append(mae)
+        self.step_outputs_agg["train_RMSE"].append(rmse)
+        # self.step_outputs_agg["train_MAPE"].append(mape)
+        return loss
+    
+    def validation_step(self, batch: tg.data.Data, batch_idx: int):
+        loss, _, mae, mse, rmse, mape = self._shared_eval_step(batch)
+        self.log("val_loss", loss, prog_bar=True, on_step=False, on_epoch=True, batch_size=self.batch_size)
+        self.log("val_MSE", mse, prog_bar=True, on_step=False, on_epoch=True, batch_size=self.batch_size)
+        self.log("val_MAE", mae, prog_bar=True, on_step=False, on_epoch=True, batch_size=self.batch_size)
+        self.log("val_RMSE", rmse, prog_bar=True, on_step=False, on_epoch=True, batch_size=self.batch_size)
+        self.log("val_MAPE", mape, prog_bar=True, on_step=False, on_epoch=True, batch_size=self.batch_size)
+        self.step_outputs_agg["val_loss"].append(loss.item())
+        self.step_outputs_agg["val_MSE"].append(mse)
+        self.step_outputs_agg["val_MAE"].append(mae)
+        self.step_outputs_agg["val_RMSE"].append(rmse)
+        self.step_outputs_agg["val_MAPE"].append(mape)
+        return loss
+    
+    def test_step(self, batch: tg.data.Data, batch_idx: int):
+        _, pred, _, _, _, _ = self._shared_eval_step(batch)
+        y_true = batch.y.float()
+        _, horizon = pred.shape
+        
+        for i in range(horizon):
+            mse_horizon = self.loss_fn(pred[:, i], y_true[:, i])
+            self.log(f"test_mse_horizon_{i+1}", mse_horizon, on_step=False, on_epoch=True, batch_size=self.batch_size)
+            mae, mse, rmse, mape = compute_metrics(y_true[:, i], pred[:, i])
+            self.log(f"test_mae_horizon_{i+1}", mae, on_step=False, on_epoch=True, batch_size=self.batch_size)
+            self.log(f"test_rmse_horizon_{i+1}", rmse, on_step=False, on_epoch=True, batch_size=self.batch_size)
+            self.log(f"test_mape_horizon_{i+1}", mape, on_step=False, on_epoch=True, batch_size= self.batch_size)
+    
+    def on_train_epoch_end(self) -> None:
+        if self.step_outputs_agg["loss"]:
+            avg_train_loss = sum(self.step_outputs_agg["loss"]) / len(self.step_outputs_agg["loss"])
+            self.history["loss"].append(avg_train_loss)
+        
+        if self.step_outputs_agg["val_loss"]:
+            avg_val_loss = sum(self.step_outputs_agg["val_loss"]) / len(self.step_outputs_agg["val_loss"])
+            self.history["val_loss"].append(avg_val_loss)
+            self.history["epochs"].append(self.current_epoch) # Align epochs with val_loss recording
+            
+        # Aggregate metrics for the epoch
+        if self.step_outputs_agg["train_MSE"]:
+            avg_train_mse = sum(self.step_outputs_agg["train_MSE"]) / len(self.step_outputs_agg["train_MSE"])
+            self.history["train_MSE"].append(avg_train_mse)
+        if self.step_outputs_agg["train_MAE"]:
+            avg_train_mae = sum(self.step_outputs_agg["train_MAE"]) / len(self.step_outputs_agg["train_MAE"])
+            self.history["train_MAE"].append(avg_train_mae)
+        if self.step_outputs_agg["train_RMSE"]:
+            avg_train_rmse = sum(self.step_outputs_agg["train_RMSE"]) / len(self.step_outputs_agg["train_RMSE"])
+            self.history["train_RMSE"].append(avg_train_rmse)
+        if self.step_outputs_agg["train_MAPE"]:
+            avg_train_mape = sum(self.step_outputs_agg["train_MAPE"]) / len(self.step_outputs_agg["train_MAPE"])
+            self.history["train_MAPE"].append(avg_train_mape)
+
+        if self.step_outputs_agg["val_MSE"]:
+            avg_val_mse = sum(self.step_outputs_agg["val_MSE"]) / len(self.step_outputs_agg["val_MSE"])
+            self.history["val_MSE"].append(avg_val_mse)
+        if self.step_outputs_agg["val_MAE"]:
+            avg_val_mae = sum(self.step_outputs_agg["val_MAE"]) / len(self.step_outputs_agg["val_MAE"])
+            self.history["val_MAE"].append(avg_val_mae)
+        if self.step_outputs_agg["val_RMSE"]:
+            avg_val_rmse = sum(self.step_outputs_agg["val_RMSE"]) / len(self.step_outputs_agg["val_RMSE"])
+            self.history["val_RMSE"].append(avg_val_rmse)
+        if self.step_outputs_agg["val_MAPE"]:
+            avg_val_mape = sum(self.step_outputs_agg["val_MAPE"]) / len(self.step_outputs_agg["val_MAPE"])
+            self.history["val_MAPE"].append(avg_val_mape)
+
+        self.step_outputs_agg = {"loss": [], "val_loss": [],
+                                    "train_MSE": [], "train_MAE": [],
+                                    "train_RMSE": [], "train_MAPE": [],
+                                    "val_MSE": [], "val_MAE": [],
+                                    "val_RMSE": [], "val_MAPE": []
+                                 } # Reset for next epoch
+        
+    def configure_optimizers(self):
+        optimizer = torch.optim.Adam(self.parameters(), lr=self.lr, weight_decay=self.weight_decay)
+        return optimizer
+
+class GATLSTMModel(L.LightningModule):
+    def __init__(self,
+                    in_channel: int,
+                    gat_out_channel: int,
+                    n_nodes: int,
+                    att_heads: int,
+                    concat_gat: bool,
+                    drop_out: float,
+                    lstm_dim: list[int],
+                    prediction_time_step: int,
+                    lr: float,
+                    weight_decay: float,
+                    batch_size: int
+                    ):
+        super().__init__()
+        self.model = GATLSTM(in_channel=in_channel,
+                                gat_out_channel=gat_out_channel,
+                                n_nodes=n_nodes,
+                                att_heads=att_heads,
+                                concat_gat=concat_gat,
+                                drop_out=drop_out,
+                                lstm_dim=lstm_dim,
+                                prediction_time_step=prediction_time_step)
+        
+        self.loss_fn = torch.nn.MSELoss() # Renamed from self.loss
+        self.batch_size = batch_size
+        self.lr = lr 
+        self.weight_decay = weight_decay
+        self.history = {
+            "epochs" : [],
+            "loss" : [],
+            "val_loss" : [],
+            "train_MSE" : [],
+            "train_MAE" : [],
+            "train_RMSE" : [],
+            "train_MAPE" : [],
+            "val_MSE" : [],
+            "val_MAE" : [],
+            "val_RMSE" : [],
+            "val_MAPE" : []
+        }
+        self.step_outputs_agg = {
+            "loss": [], 
+            "val_loss": [],
+            "train_MSE": [],
+            "train_MAE": [],
+            "train_RMSE": [],
+            "train_MAPE": [],
+            "val_MSE": [],
+            "val_MAE": [],
+            "val_RMSE": [],
+            "val_MAPE": []
+            }
+        
+        self.save_hyperparameters()
+        
+    def forward(self, data: tg.data.Data):
+        return self.model(data)
+    
+    def _shared_eval_step(self, batch: tg.data.Data):
+        pred = self.model(batch)
+        loss = self.loss_fn(pred, batch.y.float())
+        # Optionally log additional metrics using compute_metrics
+        mae, mse, rmse, mape = compute_metrics(batch.y.float(), pred)
+        return loss, pred, mae, mse, rmse, mape
+    
+    def training_step(self, batch: tg.data.Data, batch_idx: int):
+        loss, _, mae, mse, rmse, mape = self._shared_eval_step(batch)
+        self.log("loss", loss, prog_bar=True, on_step=True, on_epoch=True, batch_size=self.batch_size)
+        self.log("MSE", mse, prog_bar=True, on_step=True, on_epoch=True, batch_size=self.batch_size)
+        self.log("MAE", mae, prog_bar=True, on_step=True, on_epoch=True, batch_size=self.batch_size)
+        self.log("RMSE", rmse, prog_bar=True, on_step=True, on_epoch=True, batch_size=self.batch_size)
+        self.log("MAPE", mape, prog_bar=True, on_step=True, on_epoch=True, batch_size=self.batch_size)
+        self.step_outputs_agg["loss"].append(loss.item())
+        self.step_outputs_agg["train_MSE"].append(mse)
+        self.step_outputs_agg["train_MAE"].append(mae)
+        self.step_outputs_agg["train_RMSE"].append(rmse)
+        self.step_outputs_agg["train_MAPE"].append(mape)
+        return loss
+    
+    def validation_step(self, batch: tg.data.Data, batch_idx: int):
+        loss, _, mae, mse, rmse, mape = self._shared_eval_step(batch)
+        self.log("val_loss", loss, prog_bar=True, on_step=False, on_epoch=True, batch_size=self.batch_size)
+        self.log("val_MSE", mse, prog_bar=True, on_step=False, on_epoch=True, batch_size=self.batch_size)
+        self.log("val_MAE", mae, prog_bar=True, on_step=False, on_epoch=True, batch_size=self.batch_size)
+        self.log("val_RMSE", rmse, prog_bar=True, on_step=False, on_epoch=True, batch_size=self.batch_size)
+        self.log("val_MAPE", mape, prog_bar=True, on_step=False, on_epoch=True, batch_size=self.batch_size)
+        self.step_outputs_agg["val_loss"].append(loss.item())
+        self.step_outputs_agg["val_MSE"].append(mse)
+        self.step_outputs_agg["val_MAE"].append(mae)
+        self.step_outputs_agg["val_RMSE"].append(rmse)
+        self.step_outputs_agg["val_MAPE"].append(mape)
+        return loss
+    
+    def test_step(self, batch: tg.data.Data, batch_idx: int):
+        _, pred, _, _, _, _ = self._shared_eval_step(batch)
+        y_true = batch.y.float()
+        _, horizon = pred.shape
+        
+        for i in range(horizon):
+            mse_horizon = self.loss_fn(pred[:, i], y_true[:, i])
+            self.log(f"test_mse_horizon_{i+1}", mse_horizon, on_step=False, on_epoch=True, batch_size=self.batch_size)
+            mae, mse, rmse, mape = compute_metrics(y_true[:, i], pred[:, i])
+            self.log(f"test_mae_horizon_{i+1}", mae, on_step=False, on_epoch=True, batch_size=self.batch_size)
+            self.log(f"test_rmse_horizon_{i+1}", rmse, on_step=False, on_epoch=True, batch_size=self.batch_size)
+            self.log(f"test_mape_horizon_{i+1}", mape, on_step=False, on_epoch=True, batch_size=self.batch_size)
+    
+    def on_train_epoch_end(self) -> None:
+        if self.step_outputs_agg["loss"]:
+            avg_train_loss = sum(self.step_outputs_agg["loss"]) / len(self.step_outputs_agg["loss"])
+            self.history["loss"].append(avg_train_loss)
+        
+        if self.step_outputs_agg["val_loss"]: # val_loss might not be present if validation_epoch_frequency > 1
+            avg_val_loss = sum(self.step_outputs_agg["val_loss"]) / len(self.step_outputs_agg["val_loss"])
+            self.history["val_loss"].append(avg_val_loss)
+            self.history["epochs"].append(self.current_epoch)
+
+        # Aggregate metrics for the epoch
+        if self.step_outputs_agg["train_MSE"]:
+            avg_train_mse = sum(self.step_outputs_agg["train_MSE"]) / len(self.step_outputs_agg["train_MSE"])
+            self.history["train_MSE"].append(avg_train_mse)
+        if self.step_outputs_agg["train_MAE"]:
+            avg_train_mae = sum(self.step_outputs_agg["train_MAE"]) / len(self.step_outputs_agg["train_MAE"])
+            self.history["train_MAE"].append(avg_train_mae)
+        if self.step_outputs_agg["train_RMSE"]:
+            avg_train_rmse = sum(self.step_outputs_agg["train_RMSE"]) / len(self.step_outputs_agg["train_RMSE"])
+            self.history["train_RMSE"].append(avg_train_rmse)
+        if self.step_outputs_agg["train_MAPE"]:
+            avg_train_mape = sum(self.step_outputs_agg["train_MAPE"]) / len(self.step_outputs_agg["train_MAPE"])
+            self.history["train_MAPE"].append(avg_train_mape)
+
+        if self.step_outputs_agg["val_MSE"]:
+            avg_val_mse = sum(self.step_outputs_agg["val_MSE"]) / len(self.step_outputs_agg["val_MSE"])
+            self.history["val_MSE"].append(avg_val_mse)
+        if self.step_outputs_agg["val_MAE"]:
+            avg_val_mae = sum(self.step_outputs_agg["val_MAE"]) / len(self.step_outputs_agg["val_MAE"])
+            self.history["val_MAE"].append(avg_val_mae)
+        if self.step_outputs_agg["val_RMSE"]:
+            avg_val_rmse = sum(self.step_outputs_agg["val_RMSE"]) / len(self.step_outputs_agg["val_RMSE"])
+            self.history["val_RMSE"].append(avg_val_rmse)
+        if self.step_outputs_agg["val_MAPE"]:
+            avg_val_mape = sum(self.step_outputs_agg["val_MAPE"]) / len(self.step_outputs_agg["val_MAPE"])
+            self.history["val_MAPE"].append(avg_val_mape)
+
+        self.step_outputs_agg = {"loss": [], "val_loss": [],
+                                    "train_MSE": [], "train_MAE": [],
+                                    "train_RMSE": [], "train_MAPE": [],
+                                    "val_MSE": [], "val_MAE": [],
+                                    "val_RMSE": [], "val_MAPE": []
+                                 }
+        
+    def configure_optimizers(self):
+        optimizer = torch.optim.Adam(self.parameters(), lr=self.lr, weight_decay=self.weight_decay)
+        return optimizer
+    
